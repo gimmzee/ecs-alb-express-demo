@@ -1,51 +1,69 @@
 version: 0.2
 
 env:
-    variables:
-        AWS_REGION_NAME: ap-northeast-2
-        ECR_REPOSITORY_NAME: sbcntr-backend
-        DOCKER_BUILDKIT: "1"
-    
+  variables:
+    AWS_REGION_NAME: ap-northeast-2
+    ECR_REPOSITORY_NAME: sbcntr-backend
+    IMAGE_NAME: sbcntr-backend
+    DOCKER_BUILDKIT: "1"
+    DOCKLE_HOST: "unix:///var/run/docker.sock"   # Dockle이 로컬 Docker 데몬을 보도록 지정
+
 phases:
-    pre_build: 
-        commands:
-            - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-            - aws ecr --region ap-northeast-2 get-login-password | docker login --username AWS --password-stdin https://${AWS_ACCOUNT_ID}.dkr.ecr.ap-northeast-2.amazonaws.com/sbcntr-backend
-            - REPOSITORY_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com/${ECR_REPOSITORY_NAME}
-            # 태그 이름으로 Git 커밋 해시를 이용
-            - IMAGE_TAG=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION} | cut -c 1-7)
-            # 사전 준비: trivy를 설치
-            # 주석 처리된 curl 명령을 이용해 최신 버전을 취득하도록 구성할 수 있음
-            #- TRIVY_VERSION=$(curl -sS https://api.github.com/repos/aquasecurity/trivy/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-            - TRIVY_VERSION=0.19.2
-            - rpm -ivh https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.rpm
-            # 사전 준비: dockle 설치
-            # 주석 처리된 curl 명령을 이용해 최신 버전을 취득하도록 구성할 수 있음
-            #- DOCKLE_VERSION=$(curl -sS https://api.github.com/repos/goodwithtech/dockle/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-            - DOCKLE_VERSION=0.3.15
-            - rpm -ivh https://github.com/goodwithtech/dockle/releases/download/v${DOCKLE_VERSION}/dockle_${DOCKLE_VERSION}_Linux-64bit.rpm
-    
-    build:
-        commands:
-            - docker image build -t ${REPOSITORY_URI}:${IMAGE_TAG} .
-    
-    post_build:
-        commands:
-            # trivy를 이용한 이미지 스캔(결과 저장용)
-            - trivy --no-progress -f json -o trivy_results.json --exit-code 0 ${REPOSITORY_URI}:${IMAGE_TAG}
-            # trivy를 이용한 이미지 스캔(취약점 수준이 CRITICAL인 경우는 빌드를 강제 종료)
-            - trivy --no-progress --exit-code 1 --severity CRITICAL ${REPOSITORY_URI}:${IMAGE_TAG}
-            - exit `echo $?`
-            # dockle를 이용한 이미지 확인(취약점 수준이 FATAL인 경우는 빌드를 강제 종료)
-            - dockle --format json -o dockle_results.json --exit-code 1 --exit-level "FATAL" ${REPOSITORY_URI}:${IMAGE_TAG}
-            - exit `echo $?`
-            # Docker이미지를 ECR에 푸시
-            - docker image push ${REPOSITORY_URI}:${IMAGE_TAG}
-            # 이미지 URL을 기록한 JSON 생성
-            - printf '{"name":"%s","ImageURI":"%s"}' $ECR_REPOSITORY_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+  pre_build:
+    commands:
+      - echo "Get AWS account id..."
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+
+      - echo "Login to ECR..."
+      - aws ecr get-login-password --region ${AWS_REGION_NAME} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com
+
+      - REPOSITORY_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com/${ECR_REPOSITORY_NAME}
+      - IMAGE_TAG=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION} | head -c 7)
+      - LOCAL_IMAGE=${IMAGE_NAME}:${IMAGE_TAG}
+      - ECR_IMAGE=${REPOSITORY_URI}:${IMAGE_TAG}
+
+      - echo "IMAGE_TAG=${IMAGE_TAG}"
+      - echo "LOCAL_IMAGE=${LOCAL_IMAGE}"
+      - echo "ECR_IMAGE=${ECR_IMAGE}"
+
+      # Trivy 설치
+      - TRIVY_VERSION=0.19.2
+      - rpm -ivh https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.rpm
+
+      # Dockle 설치
+      - DOCKLE_VERSION=0.3.15
+      - rpm -ivh https://github.com/goodwithtech/dockle/releases/download/v${DOCKLE_VERSION}/dockle_${DOCKLE_VERSION}_Linux-64bit.rpm
+
+  build:
+    commands:
+      - echo "Building Docker image ${LOCAL_IMAGE}..."
+      - docker image build -t ${LOCAL_IMAGE} .
+
+  post_build:
+    commands:
+      - echo "Scanning image with Trivy (save results)..."
+      - trivy --no-progress -f json -o trivy_results.json --exit-code 0 ${LOCAL_IMAGE}
+
+      - echo "Scanning image with Trivy (fail on CRITICAL)..."
+      - trivy --no-progress --exit-code 1 --severity CRITICAL ${LOCAL_IMAGE}
+
+      - echo "Saving local image to tar for Dockle..."
+      - docker save ${LOCAL_IMAGE} -o sbcntr-backend.tar
+
+      - echo "Scanning image with Dockle (from tar)..."
+      - dockle --input sbcntr-backend.tar \
+        --format json -o dockle_results.json \
+        --exit-code 1 --exit-level "FATAL"
+
+      - echo "Tagging image for ECR and pushing..."
+      - docker tag ${LOCAL_IMAGE} ${ECR_IMAGE}
+      - docker image push ${ECR_IMAGE}
+
+      - echo "Writing imagedefinitions.json for ECS deployment..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' "${ECR_REPOSITORY_NAME}" "${ECR_IMAGE}" > imagedefinitions.json
 
 artifacts:
-    files:
-        - imagedefinitions.json
-        - trivy_results.json
-        - dockle_results.json
+  files:
+    - imagedefinitions.json
+    - trivy_results.json
+    - dockle_results.json
